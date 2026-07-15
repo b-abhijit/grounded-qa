@@ -123,11 +123,9 @@ def subject_overlap(question: str, sentence: str) -> bool:
     q_tokens = tokenize(question)
     s_tokens = tokenize(sentence)
     overlap = q_tokens & s_tokens
-
     required = [t for t in q_tokens if len(t) > 2]
     if not required:
         return False
-
     return len(overlap) >= max(1, min(2, len(required)))
 
 
@@ -165,6 +163,18 @@ def candidate_supported(question: str, sentence: str) -> bool:
         return False
 
     return True
+
+
+def build_answer(question: str, sentence: str) -> str:
+    # Keep it extractive: return the exact supporting sentence.
+    return sentence.strip()
+
+
+def exact_support_check(answer: str, chunk_text: str) -> bool:
+    # Strict verifier: answer must be an exact span from the chosen chunk.
+    a = normalize(answer).lower()
+    c = normalize(chunk_text).lower()
+    return a in c
 
 
 def find_best_support(question: str, chunks: List[Chunk]) -> Tuple[Optional[Chunk], Optional[str], float]:
@@ -211,10 +221,16 @@ async def grounded_qa(payload: QARequest):
         if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
+        answer = build_answer(question, best_sentence)
+
+        # Final strict check: the answer must literally appear in the cited chunk.
+        if not exact_support_check(answer, best_chunk.text):
+            return unanswerable_response()
+
         confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
 
         return {
-            "answer": best_sentence,
+            "answer": answer,
             "citations": [best_chunk.chunk_id],
             "confidence": confidence,
             "answerable": True
