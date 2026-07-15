@@ -1,5 +1,5 @@
 import re
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -86,21 +86,14 @@ def relation_type(question: str) -> str:
 
 
 def answer_type_supported(q_type: str, sentence: str) -> bool:
-    s = sentence.strip()
+    s = sentence.lower()
 
     if q_type == "year":
-        return extract_year(s) is not None
-
+        return extract_year(sentence) is not None
     if q_type == "who":
-        return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", s)) or \
-               any(x in s.lower() for x in ["research", "university", "inc", "corp", "lab", "laboratory"])
-
+        return " by " in s or "developed by" in s or "created by" in s or "built by" in s
     if q_type == "language":
-        return any(x in s.lower() for x in [
-            "written in", "implemented in", "programmed in",
-            "rust", "python", "java", "javascript", "go", "c++"
-        ])
-
+        return any(x in s for x in ["written in", "implemented in", "programmed in"])
     return True
 
 
@@ -110,22 +103,12 @@ def relation_supported(rel_type: str, sentence: str) -> bool:
     if rel_type == "release":
         return any(x in s for x in ["released", "open-sourced", "open sourced", "launched"])
     if rel_type == "developed":
-        return any(x in s for x in ["developed by", "created by", "built by", "made by", "developed"])
+        return any(x in s for x in ["developed by", "created by", "built by", "made by"])
     if rel_type == "language":
         return any(x in s for x in ["written in", "implemented in", "programmed in"])
     if rel_type == "founded":
-        return any(x in s for x in ["founded by", "founder", "founded"])
+        return any(x in s for x in ["founded by", "founder"])
     return True
-
-
-def subject_overlap(question: str, sentence: str) -> bool:
-    q_tokens = tokenize(question)
-    s_tokens = tokenize(sentence)
-    overlap = q_tokens & s_tokens
-    required = [t for t in q_tokens if len(t) > 2]
-    if not required:
-        return False
-    return len(overlap) >= max(1, min(2, len(required)))
 
 
 def sentence_score(question: str, sentence: str) -> float:
@@ -136,60 +119,11 @@ def sentence_score(question: str, sentence: str) -> float:
         return 0.0
 
     overlap = q_tokens & s_tokens
-    precision = len(overlap) / len(s_tokens)
-    recall = len(overlap) / len(q_tokens)
-
-    if precision + recall == 0:
-        return 0.0
-
-    score = (2 * precision * recall) / (precision + recall)
-
-    if extract_year(sentence) and question_type(question) == "year":
-        score += 0.15
-
-    return min(score, 1.0)
-
-
-def candidate_supported(question: str, sentence: str) -> bool:
-    q_type = question_type(question)
-    rel_type = relation_type(question)
-
-    if not subject_overlap(question, sentence):
-        return False
-    if not relation_supported(rel_type, sentence):
-        return False
-    if not answer_type_supported(q_type, sentence):
-        return False
-
-    return True
+    return len(overlap) / max(len(q_tokens), 1)
 
 
 def exact_support_check(answer: str, chunk_text: str) -> bool:
-    a = normalize(answer).lower()
-    c = normalize(chunk_text).lower()
-    return a in c
-
-
-def find_best_support(question: str, chunks: List[Chunk]) -> Tuple[Optional[Chunk], Optional[str], float]:
-    best_chunk = None
-    best_sentence = None
-    best_score = 0.0
-
-    for chunk in chunks:
-        if not chunk.chunk_id or not chunk.text:
-            continue
-
-        for sentence in split_sentences(chunk.text):
-            if not candidate_supported(question, sentence):
-                continue
-
-            score = sentence_score(question, sentence)
-            if score > best_score:
-                best_score = score
-                best_chunk = chunk
-                best_sentence = sentence
-
-    return best_chunk, best_sentence, best_score
+    return normalize(answer).lower() in normalize(chunk_text).lower()
 
 
 @app.post("/grounded-qa")
@@ -201,29 +135,42 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        valid_chunks = [
-            c for c in chunks
-            if isinstance(c.chunk_id, str) and c.chunk_id.strip() and isinstance(c.text, str) and c.text.strip()
-        ]
-        if not valid_chunks:
+        q_type = question_type(question)
+        rel_type = relation_type(question)
+
+        best_chunk_id = None
+        best_sentence = None
+        best_chunk_text = None
+        best_score = 0.0
+
+        for chunk in chunks:
+            if not chunk.chunk_id or not chunk.text:
+                continue
+
+            for sentence in split_sentences(chunk.text):
+                if not relation_supported(rel_type, sentence):
+                    continue
+                if not answer_type_supported(q_type, sentence):
+                    continue
+
+                score = sentence_score(question, sentence)
+                if score > best_score:
+                    best_score = score
+                    best_chunk_id = chunk.chunk_id
+                    best_sentence = sentence
+                    best_chunk_text = chunk.text
+
+        if best_chunk_id is None or best_sentence is None or best_score < 0.34:
             return unanswerable_response()
 
-        best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
-
-        THRESHOLD = 0.35
-        if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
+        if not exact_support_check(best_sentence, best_chunk_text):
             return unanswerable_response()
 
-        answer = best_sentence.strip()
-
-        if not exact_support_check(answer, best_chunk.text):
-            return unanswerable_response()
-
-        confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
+        confidence = round(min(0.95, 0.5 + best_score * 0.4), 2)
 
         return {
-            "answer": answer,
-            "citations": [best_chunk.chunk_id],
+            "answer": best_sentence,
+            "citations": [best_chunk_id],
             "confidence": confidence,
             "answerable": True
         }
@@ -234,7 +181,4 @@ async def grounded_qa(payload: QARequest):
 
 @app.get("/")
 async def health_check():
-    return {
-        "status": "ok",
-        "message": "Grounded QA API is running"
-    }
+    return {"status": "ok", "message": "Grounded QA API is running"}
