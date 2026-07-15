@@ -215,7 +215,6 @@ async def grounded_qa(payload: QARequest):
             return unanswerable_response()
 
         answer = best_sentence
-
         if not exact_support_check(answer, best_chunk.text):
             return unanswerable_response()
 
