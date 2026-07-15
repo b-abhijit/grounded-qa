@@ -63,7 +63,7 @@ def extract_year(text: str) -> Optional[str]:
 
 
 def question_type(question: str) -> str:
-    q = question.lower()
+    q = question.lower().strip()
     if "what year" in q or "which year" in q or q.startswith("when "):
         return "year"
     if q.startswith("who ") or " who " in q:
@@ -100,6 +100,8 @@ def extract_subject_tokens(question: str) -> Set[str]:
         r"what is (.+)",
         r"where is (.+)",
         r"where was (.+)",
+        r"what language is (.+) written in",
+        r"which language is (.+) written in"
     ]
 
     for pattern in patterns:
@@ -127,7 +129,7 @@ def relation_supported(rel_type: str, sentence: str) -> bool:
     relation_map = {
         "release": ["released", "open-sourced", "open sourced", "launched"],
         "developed": ["developed by", "created by", "built by", "made by", "developed"],
-        "language": ["written in", "implemented in", "programmed in", "language"],
+        "language": ["written in", "implemented in", "programmed in"],
         "founded": ["founded by", "founder", "founded"],
         "generic": []
     }
@@ -241,4 +243,7 @@ async def grounded_qa(payload: QARequest):
 
 @app.get("/")
 async def health_check():
-    return {"status": "ok", "message": "Grounded QA API is running"}
+    return {
+        "status": "ok",
+        "message": "Grounded QA API is running"
+    }
