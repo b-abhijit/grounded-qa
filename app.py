@@ -165,7 +165,9 @@ def candidate_supported(question: str, sentence: str) -> bool:
 
 
 def exact_support_check(answer: str, chunk_text: str) -> bool:
-    return normalize(answer).lower() in normalize(chunk_text).lower()
+    a = normalize(answer).lower()
+    c = normalize(chunk_text).lower()
+    return a in c
 
 
 def find_best_support(question: str, chunks: List[Chunk]) -> Tuple[Optional[Chunk], Optional[str], float]:
