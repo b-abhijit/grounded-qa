@@ -160,3 +160,4 @@ async def health_check():
         "status": "ok",
         "message": "Grounded QA API is running"
     }
+    
