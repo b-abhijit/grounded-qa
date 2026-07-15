@@ -115,7 +115,6 @@ def relation_supported(rel_type: str, sentence: str) -> bool:
         return any(x in s for x in ["written in", "implemented in", "programmed in"])
     if rel_type == "founded":
         return any(x in s for x in ["founded by", "founder", "founded"])
-
     return True
 
 
@@ -165,13 +164,7 @@ def candidate_supported(question: str, sentence: str) -> bool:
     return True
 
 
-def build_answer(question: str, sentence: str) -> str:
-    # Keep it extractive: return the exact supporting sentence.
-    return sentence.strip()
-
-
 def exact_support_check(answer: str, chunk_text: str) -> bool:
-    # Strict verifier: answer must be an exact span from the chosen chunk.
     a = normalize(answer).lower()
     c = normalize(chunk_text).lower()
     return a in c
@@ -221,9 +214,8 @@ async def grounded_qa(payload: QARequest):
         if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
-        answer = build_answer(question, best_sentence)
+        answer = best_sentence
 
-        # Final strict check: the answer must literally appear in the cited chunk.
         if not exact_support_check(answer, best_chunk.text):
             return unanswerable_response()
 
