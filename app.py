@@ -28,16 +28,30 @@ class QARequest(BaseModel):
 
 
 STOPWORDS: Set[str] = {
-    "the", "is", "are", "were", "a", "an", "of", "in", "on", "for",
-    "to", "and", "or", "what", "when", "where", "who", "which", "how",
-    "did", "does", "do", "by", "at", "as", "with", "that", "this", "it",
-    "from", "into", "their", "there", "been", "being", "have", "has", "had"
+    "the", "is", "are", "were", "was", "be", "been", "being", "a", "an", "of",
+    "in", "on", "for", "to", "and", "or", "what", "when", "where", "who",
+    "whom", "which", "how", "many", "much", "did", "does", "do", "by", "at",
+    "as", "with", "that", "this", "it", "from", "into", "their", "there",
+    "have", "has", "had", "you", "your", "please", "tell", "me", "can"
 }
+
+# words too generic to ever count as a real signal on their own
+GENERIC_WORDS: Set[str] = {"year", "name", "type", "kind", "amount", "number"}
+
+
+def stem(word: str) -> str:
+    """Very small suffix stripper so 'released'/'release', 'developed'/'develops' etc match."""
+    for suf in ("ational", "ization", "ing", "edly", "ed", "es", "ies"):
+        if len(word) > len(suf) + 3 and word.endswith(suf):
+            return word[: -len(suf)]
+    if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
 
 
 def tokenize(text: str) -> Set[str]:
     words = re.findall(r"[a-z0-9]+", text.lower())
-    return {w for w in words if w not in STOPWORDS}
+    return {stem(w) for w in words if w not in STOPWORDS}
 
 
 def split_sentences(text: str) -> List[str]:
@@ -63,31 +77,15 @@ def extract_year(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def question_type(question: str) -> str:
-    q = question.lower().strip()
-    if "what year" in q or "which year" in q or q.startswith("when "):
-        return "year"
-    if q.startswith("who ") or " who " in q:
-        return "who"
-    if q.startswith("where ") or " where " in q:
-        return "where"
-    return "generic"
+def extract_number(text: str) -> Optional[str]:
+    match = re.search(r"\b\d+(\.\d+)?\b", text)
+    return match.group(0) if match else None
 
 
-def explicit_support(q_type: str, sentence: str) -> bool:
-    s = sentence.strip()
-
-    if q_type == "year":
-        return extract_year(s) is not None
-
-    if q_type == "who":
-        return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", s)) or \
-               any(x in s.lower() for x in ["research", "university", "inc", "corp", "laboratory", "lab"])
-
-    if q_type == "where":
-        return any(x in s.lower() for x in [" in ", " at ", " from ", " based in ", " located in "])
-
-    return True
+def has_proper_noun(text: str) -> bool:
+    # crude check for a capitalized word that isn't sentence-initial-only
+    words = text.split()
+    return any(w[:1].isupper() for w in words[1:]) or (words and words[0][:1].isupper())
 
 
 def sentence_score(question: str, sentence: str) -> float:
@@ -98,14 +96,27 @@ def sentence_score(question: str, sentence: str) -> float:
         return 0.0
 
     overlap = q_tokens & s_tokens
-    precision = len(overlap) / len(s_tokens)
-    recall = len(overlap) / len(q_tokens)
+    # ignore near-empty overlaps on very short questions to avoid one-word flukes
+    meaningful_overlap = {t for t in overlap if t not in GENERIC_WORDS}
 
-    return (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
+    base_score = len(overlap) / len(q_tokens)
+
+    # require at least one non-generic overlapping token, unless it's the only token
+    if not meaningful_overlap and len(q_tokens) > 1:
+        base_score *= 0.5
+
+    q_lower = question.lower()
+    if ("what year" in q_lower or "which year" in q_lower or q_lower.startswith("when ")) and extract_year(sentence):
+        base_score += 0.2
+    if ("how many" in q_lower or "how much" in q_lower) and extract_number(sentence):
+        base_score += 0.15
+    if q_lower.startswith("who ") and has_proper_noun(sentence):
+        base_score += 0.1
+
+    return min(base_score, 1.0)
 
 
 def find_best_support(question: str, chunks: List[Chunk]):
-    q_type = question_type(question)
     best_chunk = None
     best_sentence = None
     best_score = 0.0
@@ -115,15 +126,28 @@ def find_best_support(question: str, chunks: List[Chunk]):
             continue
 
         for sentence in split_sentences(chunk.text):
-            sent = normalize_text(sentence)
-            score = sentence_score(question, sent)
-
-            if score > best_score and explicit_support(q_type, sent):
+            score = sentence_score(question, sentence)
+            if score > best_score:
                 best_score = score
                 best_chunk = chunk
-                best_sentence = sent
+                best_sentence = normalize_text(sentence)
 
     return best_chunk, best_sentence, best_score
+
+
+def answer_is_supported(question: str, answer: str) -> bool:
+    q_lower = question.lower()
+
+    if "what year" in q_lower or "which year" in q_lower or q_lower.startswith("when "):
+        return extract_year(answer) is not None
+
+    if "how many" in q_lower or "how much" in q_lower:
+        return extract_number(answer) is not None
+
+    if q_lower.startswith("who "):
+        return has_proper_noun(answer)
+
+    return True
 
 
 @app.post("/grounded-qa")
@@ -144,11 +168,14 @@ async def grounded_qa(payload: QARequest):
 
         best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
 
-        THRESHOLD = 0.55
+        THRESHOLD = 0.6
         if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
-        confidence = round(min(0.95, 0.35 + best_score * 0.5), 2)
+        if not answer_is_supported(question, best_sentence):
+            return unanswerable_response()
+
+        confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
 
         return {
             "answer": best_sentence,
@@ -163,4 +190,7 @@ async def grounded_qa(payload: QARequest):
 
 @app.get("/")
 async def health_check():
-    return {"status": "ok", "message": "Grounded QA API is running"}
+    return {
+        "status": "ok",
+        "message": "Grounded QA API is running"
+    }
