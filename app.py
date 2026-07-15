@@ -134,6 +134,53 @@ def score_sentence(question: str, sentence: str) -> float:
     return len(overlap) / len(q_words)
 
 
+def build_minimal_answer(question: str, sentence: str) -> str:
+    q = question.lower()
+    s = sentence.strip()
+
+    if "what year" in q or "when" in q:
+        m = re.search(
+            r'([A-Z][A-Za-z0-9+.# -]*?)\s+was\s+(open-sourced|released|launched)\s+in\s+(\d{4})',
+            s,
+            re.IGNORECASE
+        )
+        if m:
+            subject, verb, year = m.groups()
+            return f"{subject} was {verb} in {year}."
+
+    if q.startswith("who developed") or q.startswith("who created") or q.startswith("who built"):
+        m = re.search(
+            r'([A-Z][A-Za-z0-9+.# -]*?)\s+was\s+(developed|created|built)\s+by\s+([^.,]+)',
+            s,
+            re.IGNORECASE
+        )
+        if m:
+            subject, verb, who = m.groups()
+            return f"{subject} was {verb} by {who.strip()}."
+
+    if "what language" in q or "which language" in q or "written in" in q:
+        m = re.search(
+            r'([A-Z][A-Za-z0-9+.# -]*?)\s+.*?(written in|implemented in|programmed in)\s+([^.,]+)',
+            s,
+            re.IGNORECASE
+        )
+        if m:
+            subject, phrase, lang = m.groups()
+            return f"{subject} {phrase} {lang.strip()}."
+
+    if q.startswith("what is "):
+        m = re.search(
+            r'([A-Z][A-Za-z0-9+.# -]*?)\s+is\s+([^.,]+)',
+            s,
+            re.IGNORECASE
+        )
+        if m:
+            subject, desc = m.groups()
+            return f"{subject} is {desc.strip()}."
+
+    return s
+
+
 @app.post("/grounded-qa")
 async def grounded_qa(payload: QARequest):
     try:
@@ -174,10 +221,12 @@ async def grounded_qa(payload: QARequest):
         if not best_chunk_id or not best_sentence or best_score < 0.25:
             return unanswerable_response()
 
+        answer = build_minimal_answer(question, best_sentence)
+
         confidence = round(min(0.95, 0.55 + best_score * 0.3), 2)
 
         return {
-            "answer": best_sentence,
+            "answer": answer,
             "citations": [best_chunk_id],
             "confidence": confidence,
             "answerable": True
