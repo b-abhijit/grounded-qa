@@ -38,13 +38,13 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalize(text)) if s.strip()]
-
-
 def tokenize(text: str) -> Set[str]:
     words = re.findall(r"[a-z0-9]+", text.lower())
     return {w for w in words if w not in STOPWORDS}
+
+
+def split_sentences(text: str) -> List[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalize(text)) if s.strip()]
 
 
 def extract_year(text: str) -> Optional[str]:
@@ -72,60 +72,39 @@ def question_type(question: str) -> str:
     return "generic"
 
 
-def relation_type(question: str) -> str:
+def relation_supported(question: str, sentence: str) -> bool:
     q = question.lower()
-    if any(x in q for x in ["release", "released", "open-sourced", "open sourced", "launched"]):
-        return "release"
-    if any(x in q for x in ["developed", "created", "built", "made"]):
-        return "developed"
-    if any(x in q for x in ["written in", "programmed in", "language"]):
-        return "language"
-    if any(x in q for x in ["founded", "founder"]):
-        return "founded"
-    return "generic"
-
-
-def answer_type_supported(q_type: str, sentence: str) -> bool:
-    s = sentence.strip()
-
-    if q_type == "year":
-        return extract_year(s) is not None
-
-    if q_type == "who":
-        return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", s)) or \
-               any(x in s.lower() for x in ["research", "university", "inc", "corp", "lab", "laboratory"])
-
-    if q_type == "language":
-        return any(x in s.lower() for x in ["written in", "implemented in", "programmed in", "rust", "python", "java", "javascript", "go", "c++"])
-
-    return True
-
-
-def relation_supported(rel_type: str, sentence: str) -> bool:
     s = sentence.lower()
 
-    if rel_type == "release":
+    if any(x in q for x in ["release", "released", "open-sourced", "open sourced", "launched"]):
         return any(x in s for x in ["released", "open-sourced", "open sourced", "launched"])
-    if rel_type == "developed":
+
+    if any(x in q for x in ["developed", "created", "built", "made"]):
         return any(x in s for x in ["developed by", "created by", "built by", "made by", "developed"])
-    if rel_type == "language":
+
+    if any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
         return any(x in s for x in ["written in", "implemented in", "programmed in"])
-    if rel_type == "founded":
+
+    if any(x in q for x in ["founded", "founder"]):
         return any(x in s for x in ["founded by", "founder", "founded"])
 
     return True
 
 
-def subject_overlap(question: str, sentence: str) -> bool:
-    q_tokens = tokenize(question)
-    s_tokens = tokenize(sentence)
-    overlap = q_tokens & s_tokens
+def answer_type_supported(question: str, sentence: str) -> bool:
+    q_type = question_type(question)
 
-    required = [t for t in q_tokens if len(t) > 2]
-    if not required:
-        return False
+    if q_type == "year":
+        return extract_year(sentence) is not None
 
-    return len(overlap) >= max(1, min(2, len(required)))
+    if q_type == "who":
+        return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", sentence)) or \
+               any(x in sentence.lower() for x in ["research", "university", "inc", "corp", "lab", "laboratory"])
+
+    if q_type == "language":
+        return any(x in sentence.lower() for x in ["written in", "implemented in", "programmed in", "rust", "python", "java", "javascript", "go", "c++"])
+
+    return True
 
 
 def sentence_score(question: str, sentence: str) -> float:
@@ -136,6 +115,9 @@ def sentence_score(question: str, sentence: str) -> float:
         return 0.0
 
     overlap = q_tokens & s_tokens
+    if not overlap:
+        return 0.0
+
     precision = len(overlap) / len(s_tokens)
     recall = len(overlap) / len(q_tokens)
 
@@ -144,28 +126,14 @@ def sentence_score(question: str, sentence: str) -> float:
 
     score = (2 * precision * recall) / (precision + recall)
 
-    if extract_year(sentence) and question_type(question) == "year":
+    if question_type(question) == "year" and extract_year(sentence):
         score += 0.15
 
     return min(score, 1.0)
 
 
-def candidate_supported(question: str, sentence: str) -> bool:
-    q_type = question_type(question)
-    rel_type = relation_type(question)
-
-    if not subject_overlap(question, sentence):
-        return False
-    if not relation_supported(rel_type, sentence):
-        return False
-    if not answer_type_supported(q_type, sentence):
-        return False
-
-    return True
-
-
-def find_best_support(question: str, chunks: List[Chunk]) -> Tuple[Optional[Chunk], Optional[str], float]:
-    best_chunk = None
+def find_best_sentence(question: str, chunks: List[Chunk]) -> Tuple[Optional[str], Optional[str], float]:
+    best_chunk_id = None
     best_sentence = None
     best_score = 0.0
 
@@ -174,16 +142,18 @@ def find_best_support(question: str, chunks: List[Chunk]) -> Tuple[Optional[Chun
             continue
 
         for sentence in split_sentences(chunk.text):
-            if not candidate_supported(question, sentence):
+            if not relation_supported(question, sentence):
+                continue
+            if not answer_type_supported(question, sentence):
                 continue
 
             score = sentence_score(question, sentence)
             if score > best_score:
                 best_score = score
-                best_chunk = chunk
+                best_chunk_id = chunk.chunk_id
                 best_sentence = sentence
 
-    return best_chunk, best_sentence, best_score
+    return best_chunk_id, best_sentence, best_score
 
 
 @app.post("/grounded-qa")
@@ -202,17 +172,17 @@ async def grounded_qa(payload: QARequest):
         if not valid_chunks:
             return unanswerable_response()
 
-        best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
+        best_chunk_id, best_sentence, best_score = find_best_sentence(question, valid_chunks)
 
-        THRESHOLD = 0.35
-        if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
+        THRESHOLD = 0.45
+        if best_chunk_id is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
-        confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
+        confidence = round(min(0.95, 0.45 + best_score * 0.4), 2)
 
         return {
             "answer": best_sentence,
-            "citations": [best_chunk.chunk_id],
+            "citations": [best_chunk_id],
             "confidence": confidence,
             "answerable": True
         }
@@ -223,7 +193,4 @@ async def grounded_qa(payload: QARequest):
 
 @app.get("/")
 async def health_check():
-    return {
-        "status": "ok",
-        "message": "Grounded QA API is running"
-    }
+    return {"status": "ok", "message": "Grounded QA API is running"}
