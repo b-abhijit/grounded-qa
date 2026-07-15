@@ -112,11 +112,20 @@ def relation_supported(rel_type: str, sentence: str) -> bool:
 def subject_overlap(question: str, sentence: str) -> bool:
     q_tokens = tokenize(question)
     s_tokens = tokenize(sentence)
-    overlap = q_tokens & s_tokens
-    required = [t for t in q_tokens if len(t) > 2]
-    if not required:
+
+    relation_words = {
+        "release", "released", "open", "opened", "open-sourced", "launched",
+        "developed", "created", "built", "made",
+        "written", "programmed", "language",
+        "founded", "founder", "year", "when", "who", "what", "which"
+    }
+
+    entity_tokens = {t for t in q_tokens if t not in relation_words and len(t) > 2}
+    if not entity_tokens:
         return False
-    return len(overlap) >= max(1, min(2, len(required)))
+
+    overlap = entity_tokens & s_tokens
+    return len(overlap) == len(entity_tokens)
 
 
 def sentence_score(question: str, sentence: str) -> float:
