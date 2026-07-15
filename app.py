@@ -165,9 +165,7 @@ def candidate_supported(question: str, sentence: str) -> bool:
 
 
 def exact_support_check(answer: str, chunk_text: str) -> bool:
-    a = normalize(answer).lower()
-    c = normalize(chunk_text).lower()
-    return a in c
+    return normalize(answer).lower() in normalize(chunk_text).lower()
 
 
 def find_best_support(question: str, chunks: List[Chunk]) -> Tuple[Optional[Chunk], Optional[str], float]:
@@ -214,7 +212,7 @@ async def grounded_qa(payload: QARequest):
         if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
-        answer = best_sentence
+        answer = best_sentence.strip()
 
         if not exact_support_check(answer, best_chunk.text):
             return unanswerable_response()
