@@ -1,5 +1,5 @@
 import re
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,21 +26,17 @@ class QARequest(BaseModel):
     chunks: Optional[List[Chunk]] = None
 
 
-STOPWORDS: Set[str] = {
-    "the", "is", "are", "were", "a", "an", "of", "in", "on", "for",
-    "to", "and", "or", "what", "when", "where", "who", "which", "how",
-    "did", "does", "do", "by", "at", "as", "with", "that", "this", "it",
-    "from", "into", "their", "there", "been", "being", "have", "has", "had"
-}
+def unanswerable_response():
+    return {
+        "answer": "I don't know",
+        "citations": [],
+        "confidence": 0.1,
+        "answerable": False
+    }
 
 
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
-
-
-def tokenize(text: str) -> Set[str]:
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return {w for w in words if w not in STOPWORDS}
 
 
 def split_sentences(text: str) -> List[str]:
@@ -52,108 +48,90 @@ def extract_year(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def unanswerable_response():
-    return {
-        "answer": "I don't know",
-        "citations": [],
-        "confidence": 0.1,
-        "answerable": False
-    }
+def extract_subject(question: str) -> str:
+    q = normalize(question).rstrip("?.")
+
+    patterns = [
+        r"what year was (.+?) released$",
+        r"which year was (.+?) released$",
+        r"when was (.+?) released$",
+        r"what year was (.+?) open[- ]sourced$",
+        r"when was (.+?) open[- ]sourced$",
+        r"who developed (.+)$",
+        r"who created (.+)$",
+        r"who built (.+)$",
+        r"what language is (.+?) written in$",
+        r"which language is (.+?) written in$",
+        r"what is (.+)$",
+    ]
+
+    for p in patterns:
+        m = re.match(p, q, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+
+    return ""
 
 
-def question_type(question: str) -> str:
+def subject_in_sentence(subject: str, sentence: str) -> bool:
+    if not subject:
+        return False
+
+    subject_tokens = [t for t in re.findall(r"[a-z0-9]+", subject.lower()) if len(t) > 2]
+    sentence_lower = sentence.lower()
+
+    if not subject_tokens:
+        return False
+
+    return all(token in sentence_lower for token in subject_tokens)
+
+
+def classify_question(question: str) -> str:
     q = question.lower()
+
     if "what year" in q or "which year" in q or q.startswith("when "):
         return "year"
-    if q.startswith("who ") or " who " in q:
+    if q.startswith("who "):
         return "who"
-    if "written in" in q or "programmed in" in q or "what language" in q or "which language" in q:
+    if "written in" in q or "what language" in q or "which language" in q:
         return "language"
-    return "generic"
+    if q.startswith("what is "):
+        return "definition"
+
+    return "unsupported"
 
 
-def relation_supported(question: str, sentence: str) -> bool:
-    q = question.lower()
+def sentence_answers_question(question: str, sentence: str) -> bool:
+    qtype = classify_question(question)
     s = sentence.lower()
 
-    if any(x in q for x in ["release", "released", "open-sourced", "open sourced", "launched"]):
-        return any(x in s for x in ["released", "open-sourced", "open sourced", "launched"])
+    if qtype == "year":
+        return (
+            extract_year(sentence) is not None and
+            any(x in s for x in ["released", "open-sourced", "open sourced", "launched"])
+        )
 
-    if any(x in q for x in ["developed", "created", "built", "made"]):
-        return any(x in s for x in ["developed by", "created by", "built by", "made by", "developed"])
+    if qtype == "who":
+        return any(x in s for x in ["developed by", "created by", "built by", "made by"])
 
-    if any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
+    if qtype == "language":
         return any(x in s for x in ["written in", "implemented in", "programmed in"])
 
-    if any(x in q for x in ["founded", "founder"]):
-        return any(x in s for x in ["founded by", "founder", "founded"])
+    if qtype == "definition":
+        return True
 
-    return True
-
-
-def answer_type_supported(question: str, sentence: str) -> bool:
-    q_type = question_type(question)
-
-    if q_type == "year":
-        return extract_year(sentence) is not None
-
-    if q_type == "who":
-        return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b", sentence)) or \
-               any(x in sentence.lower() for x in ["research", "university", "inc", "corp", "lab", "laboratory"])
-
-    if q_type == "language":
-        return any(x in sentence.lower() for x in ["written in", "implemented in", "programmed in", "rust", "python", "java", "javascript", "go", "c++"])
-
-    return True
+    return False
 
 
-def sentence_score(question: str, sentence: str) -> float:
-    q_tokens = tokenize(question)
-    s_tokens = tokenize(sentence)
+def score_sentence(question: str, sentence: str) -> float:
+    q_words = set(re.findall(r"[a-z0-9]+", question.lower()))
+    s_words = set(re.findall(r"[a-z0-9]+", sentence.lower()))
 
-    if not q_tokens or not s_tokens:
+    if not q_words or not s_words:
         return 0.0
 
-    overlap = q_tokens & s_tokens
-    if not overlap:
-        return 0.0
-
-    precision = len(overlap) / len(s_tokens)
-    recall = len(overlap) / len(q_tokens)
-
-    if precision + recall == 0:
-        return 0.0
-
-    score = (2 * precision * recall) / (precision + recall)
-
-    if question_type(question) == "year" and extract_year(sentence):
-        score += 0.15
-
-    return min(score, 1.0)
-
-
-def find_best_sentence(question: str, chunks: List[Chunk]) -> Tuple[Optional[str], Optional[str], float]:
-    best_chunk_id = None
-    best_sentence = None
-    best_score = 0.0
-
-    for chunk in chunks:
-        if not chunk.chunk_id or not chunk.text:
-            continue
-
-        for sentence in split_sentences(chunk.text):
-            if not relation_supported(question, sentence):
-                continue
-            if not answer_type_supported(question, sentence):
-                continue
-
-            score = sentence_score(question, sentence)
-            if score > best_score:
-                best_score = score
-                best_chunk_id = chunk.chunk_id
-                best_sentence = sentence
-
-    return best_chunk_id, best_sentence, best_score
+    overlap = q_words & s_words
+    return len(overlap) / len(q_words)
 
 
 @app.post("/grounded-qa")
@@ -165,20 +143,38 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        valid_chunks = [
-            c for c in chunks
-            if isinstance(c.chunk_id, str) and c.chunk_id.strip() and isinstance(c.text, str) and c.text.strip()
-        ]
-        if not valid_chunks:
+        qtype = classify_question(question)
+        if qtype == "unsupported":
             return unanswerable_response()
 
-        best_chunk_id, best_sentence, best_score = find_best_sentence(question, valid_chunks)
-
-        THRESHOLD = 0.45
-        if best_chunk_id is None or best_sentence is None or best_score < THRESHOLD:
+        subject = extract_subject(question)
+        if not subject:
             return unanswerable_response()
 
-        confidence = round(min(0.95, 0.45 + best_score * 0.4), 2)
+        best_chunk_id = None
+        best_sentence = None
+        best_score = 0.0
+
+        for chunk in chunks:
+            if not chunk.chunk_id or not chunk.text:
+                continue
+
+            for sentence in split_sentences(chunk.text):
+                if not subject_in_sentence(subject, sentence):
+                    continue
+                if not sentence_answers_question(question, sentence):
+                    continue
+
+                score = score_sentence(question, sentence)
+                if score > best_score:
+                    best_score = score
+                    best_chunk_id = chunk.chunk_id
+                    best_sentence = sentence
+
+        if not best_chunk_id or not best_sentence or best_score < 0.25:
+            return unanswerable_response()
+
+        confidence = round(min(0.95, 0.55 + best_score * 0.3), 2)
 
         return {
             "answer": best_sentence,
