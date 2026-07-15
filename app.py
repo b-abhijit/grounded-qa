@@ -71,16 +71,38 @@ def sentence_score(question: str, sentence: str) -> float:
         return 0.0
 
     overlap = q_tokens & s_tokens
-    base_score = len(overlap) / len(q_tokens)
+    return len(overlap) / len(q_tokens)
 
-    q_lower = question.lower()
-    if ("what year" in q_lower or "which year" in q_lower or q_lower.startswith("when ")) and extract_year(sentence):
-        base_score += 0.2
 
-    return min(base_score, 1.0)
+def question_type(question: str) -> str:
+    q = question.lower().strip()
+
+    if "what year" in q or "which year" in q or q.startswith("when "):
+        return "year"
+    if q.startswith("who ") or " who " in q:
+        return "who"
+    if q.startswith("where ") or " where " in q:
+        return "where"
+    return "generic"
+
+
+def supports_question_type(q_type: str, sentence: str) -> bool:
+    if q_type == "year":
+        return extract_year(sentence) is not None
+
+    if q_type == "who":
+        return bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", sentence)) or \
+               any(org_word in sentence.lower() for org_word in ["ai", "research", "inc", "corp", "university", "lab"])
+
+    if q_type == "where":
+        return any(prep in sentence.lower() for prep in [" in ", " at ", " from ", " based in "])
+
+    return True
 
 
 def find_best_support(question: str, chunks: List[Chunk]):
+    q_type = question_type(question)
+
     best_chunk = None
     best_sentence = None
     best_score = 0.0
@@ -96,16 +118,13 @@ def find_best_support(question: str, chunks: List[Chunk]):
                 best_chunk = chunk
                 best_sentence = normalize_text(sentence)
 
+    if best_sentence is None:
+        return None, None, 0.0
+
+    if not supports_question_type(q_type, best_sentence):
+        return None, None, 0.0
+
     return best_chunk, best_sentence, best_score
-
-
-def answer_is_supported(question: str, answer: str) -> bool:
-    q_lower = question.lower()
-
-    if "what year" in q_lower or "which year" in q_lower or q_lower.startswith("when "):
-        return extract_year(answer) is not None
-
-    return True
 
 
 @app.post("/grounded-qa")
@@ -126,14 +145,11 @@ async def grounded_qa(payload: QARequest):
 
         best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
 
-        THRESHOLD = 0.55
+        THRESHOLD = 0.6
         if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
-        if not answer_is_supported(question, best_sentence):
-            return unanswerable_response()
-
-        confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
+        confidence = round(min(0.95, 0.4 + best_score * 0.45), 2)
 
         return {
             "answer": best_sentence,
