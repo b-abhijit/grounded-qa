@@ -28,7 +28,7 @@ class QARequest(BaseModel):
 
 
 STOPWORDS: Set[str] = {
-    "the", "is", "was", "are", "were", "a", "an", "of", "in", "on", "for",
+    "the", "is", "are", "were", "a", "an", "of", "in", "on", "for",
     "to", "and", "or", "what", "when", "where", "who", "which", "how",
     "did", "does", "do", "by", "at", "as", "with", "that", "this", "it",
     "from", "into", "their", "there", "been", "being", "have", "has", "had"
@@ -45,6 +45,10 @@ def split_sentences(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
 def unanswerable_response():
     return {
         "answer": "I don't know",
@@ -59,11 +63,24 @@ def extract_year(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def best_chunk_and_sentence(question: str, chunks: List[Chunk]):
+def sentence_score(question: str, sentence: str) -> float:
     q_tokens = tokenize(question)
-    if not q_tokens:
-        return None, None, 0.0
+    s_tokens = tokenize(sentence)
 
+    if not q_tokens or not s_tokens:
+        return 0.0
+
+    overlap = q_tokens & s_tokens
+    base_score = len(overlap) / len(q_tokens)
+
+    q_lower = question.lower()
+    if ("what year" in q_lower or "which year" in q_lower or q_lower.startswith("when ")) and extract_year(sentence):
+        base_score += 0.2
+
+    return min(base_score, 1.0)
+
+
+def find_best_support(question: str, chunks: List[Chunk]):
     best_chunk = None
     best_sentence = None
     best_score = 0.0
@@ -73,46 +90,28 @@ def best_chunk_and_sentence(question: str, chunks: List[Chunk]):
             continue
 
         for sentence in split_sentences(chunk.text):
-            s_tokens = tokenize(sentence)
-            if not s_tokens:
-                continue
-
-            overlap = q_tokens & s_tokens
-            score = len(overlap) / max(len(q_tokens), 1)
-
+            score = sentence_score(question, sentence)
             if score > best_score:
                 best_score = score
                 best_chunk = chunk
-                best_sentence = sentence.strip()
+                best_sentence = normalize_text(sentence)
 
     return best_chunk, best_sentence, best_score
 
 
-def build_grounded_answer(question: str, sentence: str) -> Optional[str]:
-    q_lower = question.lower().strip()
+def answer_is_supported(question: str, answer: str) -> bool:
+    q_lower = question.lower()
 
     if "what year" in q_lower or "which year" in q_lower or q_lower.startswith("when "):
-        year = extract_year(sentence)
-        if not year:
-            return None
+        return extract_year(answer) is not None
 
-        subject_match = re.search(
-            r"(?:what year was|which year was|when was)\s+(.+?)(?:\?|$)",
-            q_lower
-        )
-        if subject_match:
-            subject = subject_match.group(1).strip()
-            if subject:
-                return f"{subject.upper() if subject.isupper() else subject} was released in {year}."
-        return year
-
-    return sentence
+    return True
 
 
 @app.post("/grounded-qa")
 async def grounded_qa(payload: QARequest):
     try:
-        question = (payload.question or "").strip()
+        question = normalize_text(payload.question or "")
         chunks = payload.chunks or []
 
         if not question or not chunks:
@@ -125,26 +124,19 @@ async def grounded_qa(payload: QARequest):
         if not valid_chunks:
             return unanswerable_response()
 
-        best_chunk, best_sentence, best_score = best_chunk_and_sentence(question, valid_chunks)
+        best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
 
-        THRESHOLD = 0.5
+        THRESHOLD = 0.55
         if best_chunk is None or best_sentence is None or best_score < THRESHOLD:
             return unanswerable_response()
 
-        answer = build_grounded_answer(question, best_sentence)
-        if not answer:
+        if not answer_is_supported(question, best_sentence):
             return unanswerable_response()
 
-        if answer != best_sentence:
-            answer_tokens = tokenize(answer)
-            sentence_tokens = tokenize(best_sentence)
-            if not answer_tokens.issubset(sentence_tokens) and not extract_year(best_sentence):
-                return unanswerable_response()
-
-        confidence = round(min(0.95, 0.55 + best_score * 0.35), 2)
+        confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
 
         return {
-            "answer": answer,
+            "answer": best_sentence,
             "citations": [best_chunk.chunk_id],
             "confidence": confidence,
             "answerable": True
@@ -160,4 +152,3 @@ async def health_check():
         "status": "ok",
         "message": "Grounded QA API is running"
     }
-    
