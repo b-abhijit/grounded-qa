@@ -1,5 +1,5 @@
 import re
-from typing import List, Set
+from typing import List, Set, Optional, Tuple
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,9 +61,19 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 
+def split_sentences(text: str) -> List[str]:
+    text = normalize(text)
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
 def tokenize(text: str) -> Set[str]:
     words = re.findall(r"[a-z0-9]+", text.lower())
     return {w for w in words if w not in STOPWORDS}
+
+
+def extract_year(text: str) -> Optional[str]:
+    m = re.search(r"\b(19|20)\d{2}\b", text)
+    return m.group(0) if m else None
 
 
 def unanswerable_response() -> QAResponse:
@@ -73,6 +83,17 @@ def unanswerable_response() -> QAResponse:
         confidence=0.1,
         answerable=False,
     )
+
+
+def question_type(question: str) -> str:
+    q = question.lower()
+    if "what year" in q or "which year" in q or q.startswith("when "):
+        return "year"
+    if q.startswith("who ") or " who " in q:
+        return "who"
+    if any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
+        return "language"
+    return "unknown"
 
 
 def subject_tokens(question: str) -> Set[str]:
@@ -87,45 +108,43 @@ def subject_tokens(question: str) -> Set[str]:
     return {t for t in q_tokens if t not in ignore and len(t) > 2}
 
 
-def question_type(question: str) -> str:
-    q = question.lower()
-    if "what year" in q or "which year" in q or q.startswith("when "):
-        return "year"
-    if q.startswith("who ") or " who " in q:
-        return "who"
-    if any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
-        return "language"
-    return "unknown"
-
-
-def exact_chunk_match(question: str, chunk_text: str) -> bool:
-    q = question.lower()
-    text = chunk_text.lower()
+def subject_matches(question: str, sentence: str) -> bool:
     needed = subject_tokens(question)
-
     if not needed:
         return False
+    return needed.issubset(tokenize(sentence))
 
-    chunk_tokens = tokenize(chunk_text)
-    if not needed.issubset(chunk_tokens):
-        return False
 
+def sentence_matches(question: str, sentence: str) -> bool:
+    q = question.lower()
+    s = sentence.lower()
     q_type = question_type(question)
 
+    if not subject_matches(question, sentence):
+        return False
+
     if q_type == "year":
-        if not re.search(r"\b(19|20)\d{2}\b", text):
-            return False
-        if not any(x in text for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"]):
-            return False
-        return True
+        return (
+            extract_year(sentence) is not None
+            and any(x in s for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"])
+        )
 
     if q_type == "who":
-        return any(x in text for x in ["developed by", "created by", "built by", "made by", "founded by"])
+        return any(x in s for x in ["developed by", "created by", "built by", "made by", "founded by"])
 
     if q_type == "language":
-        return any(x in text for x in ["written in", "implemented in", "programmed in"])
+        return any(x in s for x in ["written in", "implemented in", "programmed in"])
 
     return False
+
+
+def find_matches(question: str, chunks: List[Chunk]) -> List[Tuple[str, str]]:
+    matches = []
+    for chunk in chunks:
+        for sentence in split_sentences(chunk.text):
+            if sentence_matches(question, sentence):
+                matches.append((chunk.chunk_id, sentence))
+    return matches
 
 
 @app.post("/grounded-qa", response_model=QAResponse)
@@ -137,19 +156,18 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        matches = [chunk for chunk in chunks if exact_chunk_match(question, chunk.text)]
+        matches = find_matches(question, chunks)
 
-        # Strict abstention policy:
-        # zero matches => unanswerable
-        # multiple matches => ambiguous => unanswerable
+        # Strictest safe behavior:
+        # exactly one matching sentence in exactly one chunk
         if len(matches) != 1:
             return unanswerable_response()
 
-        match = matches[0]
+        chunk_id, answer_sentence = matches[0]
 
         return QAResponse(
-            answer=match.text.strip(),
-            citations=[match.chunk_id],
+            answer=answer_sentence,
+            citations=[chunk_id],
             confidence=0.9,
             answerable=True,
         )
