@@ -109,24 +109,44 @@ def strong_support(question: str, sentence: str) -> bool:
     overlap = q_tokens & s_tokens
     return len(overlap) >= 2 and (extract_year(sentence) is not None or len(sentence) < 120)
 
-@app.post("/grounded-qa", response_model=QAResponse)
+@app.post("/grounded-qa")
 async def grounded_qa(payload: QARequest):
     try:
-        question = normalize(payload.question)
+        question = normalize(payload.question or "")
+        chunks = payload.chunks or []
 
-        for chunk in payload.chunks:
-            for sentence in split_sentences(chunk.text):
-                candidate = exact_answer_from_sentence(question, sentence)
-                if candidate and strong_support(question, sentence):
-                    if normalize(candidate).lower() in normalize(chunk.text).lower():
-                        return QAResponse(
-                            answer=candidate,
-                            citations=[chunk.chunk_id],
-                            confidence=0.95,
-                            answerable=True,
-                        )
+        if not question or not chunks:
+            return unanswerable_response()
 
-        return unanswerable_response()
+        valid_chunks = [
+            c for c in chunks
+            if isinstance(c.chunk_id, str) and c.chunk_id.strip()
+            and isinstance(c.text, str) and c.text.strip()
+        ]
+        if not valid_chunks:
+            return unanswerable_response()
+
+        best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
+
+        # Be stricter than before
+        if best_chunk is None or best_sentence is None or best_score < 0.50:
+            return unanswerable_response()
+
+        # Only use the exact sentence from the cited chunk
+        answer = best_sentence.strip()
+
+        # Hard support check: answer must exactly be a sentence in that same chunk
+        sentences_in_chunk = [s.strip() for s in split_sentences(best_chunk.text)]
+        if answer not in sentences_in_chunk:
+            return unanswerable_response()
+
+        return {
+            "answer": answer,
+            "citations": [best_chunk.chunk_id],
+            "confidence": 0.9,
+            "answerable": True,
+        }
+
     except Exception:
         return unanswerable_response()
 
