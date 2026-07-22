@@ -63,7 +63,9 @@ def normalize(text: str) -> str:
 
 def split_sentences(text: str) -> List[str]:
     text = normalize(text)
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    # safer sentence split
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
 
 
 def tokenize(text: str) -> Set[str]:
@@ -116,9 +118,8 @@ def subject_matches(question: str, sentence: str) -> bool:
 
 
 def sentence_matches(question: str, sentence: str) -> bool:
-    q = question.lower()
-    s = sentence.lower()
     q_type = question_type(question)
+    s = sentence.lower()
 
     if not subject_matches(question, sentence):
         return False
@@ -126,14 +127,21 @@ def sentence_matches(question: str, sentence: str) -> bool:
     if q_type == "year":
         return (
             extract_year(sentence) is not None
-            and any(x in s for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"])
+            and any(x in s for x in [
+                "released", "open-sourced", "open sourced",
+                "launched", "developed", "created", "founded"
+            ])
         )
 
     if q_type == "who":
-        return any(x in s for x in ["developed by", "created by", "built by", "made by", "founded by"])
+        return any(x in s for x in [
+            "developed by", "created by", "built by", "made by", "founded by"
+        ])
 
     if q_type == "language":
-        return any(x in s for x in ["written in", "implemented in", "programmed in"])
+        return any(x in s for x in [
+            "written in", "implemented in", "programmed in"
+        ])
 
     return False
 
@@ -158,15 +166,16 @@ async def grounded_qa(payload: QARequest):
 
         matches = find_matches(question, chunks)
 
-        # Strictest safe behavior:
-        # exactly one matching sentence in exactly one chunk
+        # Exact strict mode:
+        # 0 matches => unanswerable
+        # >1 matches => ambiguous => unanswerable
         if len(matches) != 1:
             return unanswerable_response()
 
         chunk_id, answer_sentence = matches[0]
 
         return QAResponse(
-            answer=answer_sentence,
+            answer=answer_sentence.strip(),
             citations=[chunk_id],
             confidence=0.9,
             answerable=True,
