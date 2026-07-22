@@ -1,5 +1,5 @@
 import re
-from typing import List, Set, Optional, Tuple
+from typing import List, Set, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,9 +63,7 @@ def normalize(text: str) -> str:
 
 def split_sentences(text: str) -> List[str]:
     text = normalize(text)
-    # safer sentence split
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
 def tokenize(text: str) -> Set[str]:
@@ -117,42 +115,62 @@ def subject_matches(question: str, sentence: str) -> bool:
     return needed.issubset(tokenize(sentence))
 
 
-def sentence_matches(question: str, sentence: str) -> bool:
+def extract_candidate_answer(question: str, sentence: str) -> Optional[str]:
     q_type = question_type(question)
     s = sentence.lower()
 
     if not subject_matches(question, sentence):
-        return False
+        return None
 
     if q_type == "year":
-        return (
-            extract_year(sentence) is not None
-            and any(x in s for x in [
-                "released", "open-sourced", "open sourced",
-                "launched", "developed", "created", "founded"
-            ])
-        )
+        if extract_year(sentence) and any(x in s for x in [
+            "released", "open-sourced", "open sourced", "launched",
+            "developed", "created", "founded"
+        ]):
+            return sentence.strip()
 
     if q_type == "who":
-        return any(x in s for x in [
+        if any(x in s for x in [
             "developed by", "created by", "built by", "made by", "founded by"
-        ])
+        ]):
+            return sentence.strip()
 
     if q_type == "language":
-        return any(x in s for x in [
+        if any(x in s for x in [
             "written in", "implemented in", "programmed in"
-        ])
+        ]):
+            return sentence.strip()
 
-    return False
+    return None
 
 
-def find_matches(question: str, chunks: List[Chunk]) -> List[Tuple[str, str]]:
-    matches = []
+def find_candidate_answer(question: str, chunks: List[Chunk]) -> Optional[str]:
+    candidates = []
+
     for chunk in chunks:
         for sentence in split_sentences(chunk.text):
-            if sentence_matches(question, sentence):
-                matches.append((chunk.chunk_id, sentence))
-    return matches
+            ans = extract_candidate_answer(question, sentence)
+            if ans:
+                candidates.append(ans)
+
+    unique_candidates = list(dict.fromkeys(candidates))
+
+    if len(unique_candidates) != 1:
+        return None
+
+    return unique_candidates[0]
+
+
+def find_supporting_chunk_ids(answer: str, chunks: List[Chunk]) -> List[str]:
+    answer_norm = normalize(answer).lower()
+    supporting = []
+
+    for chunk in chunks:
+        chunk_text_norm = normalize(chunk.text).lower()
+        if answer_norm in chunk_text_norm:
+            supporting.append(chunk.chunk_id)
+
+    return supporting
 
 
 @app.post("/grounded-qa", response_model=QAResponse)
@@ -164,19 +182,20 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        matches = find_matches(question, chunks)
-
-        # Exact strict mode:
-        # 0 matches => unanswerable
-        # >1 matches => ambiguous => unanswerable
-        if len(matches) != 1:
+        candidate_answer = find_candidate_answer(question, chunks)
+        if not candidate_answer:
             return unanswerable_response()
 
-        chunk_id, answer_sentence = matches[0]
+        supporting_chunk_ids = find_supporting_chunk_ids(candidate_answer, chunks)
+
+        # Deterministic citation repair:
+        # cite only if exactly one chunk literally contains the exact answer text
+        if len(supporting_chunk_ids) != 1:
+            return unanswerable_response()
 
         return QAResponse(
-            answer=answer_sentence.strip(),
-            citations=[chunk_id],
+            answer=candidate_answer,
+            citations=[supporting_chunk_ids[0]],
             confidence=0.9,
             answerable=True,
         )
