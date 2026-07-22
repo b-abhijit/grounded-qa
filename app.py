@@ -71,6 +71,11 @@ def tokenize(text: str) -> Set[str]:
     return {w for w in words if w not in STOPWORDS}
 
 
+def extract_year(text: str) -> Optional[str]:
+    m = re.search(r"\b(19|20)\d{2}\b", text)
+    return m.group(0) if m else None
+
+
 def unanswerable_response() -> QAResponse:
     return QAResponse(
         answer="I don't know",
@@ -106,88 +111,66 @@ def subject_matches(question: str, sentence: str) -> bool:
     needed = subject_tokens(question)
     if not needed:
         return False
-    s_tokens = tokenize(sentence)
-    return needed.issubset(s_tokens)
+    return needed.issubset(tokenize(sentence))
 
 
-def extract_year_answer(question: str, sentence: str) -> Optional[str]:
-    if not subject_matches(question, sentence):
-        return None
-    if not any(x in question.lower() for x in ["what year", "which year", "when "]):
-        return None
-
-    year_match = re.search(r"\b(19|20)\d{2}\b", sentence)
-    if not year_match:
-        return None
-
-    if not any(x in sentence.lower() for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"]):
-        return None
-
-    return sentence.strip()
-
-
-def extract_language_answer(question: str, sentence: str) -> Optional[str]:
+def year_sentence_matches(question: str, sentence: str) -> bool:
     q = question.lower()
     s = sentence.lower()
-
-    if not subject_matches(question, sentence):
-        return None
-    if not any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
-        return None
-    if not any(x in s for x in ["written in", "implemented in", "programmed in"]):
-        return None
-
-    return sentence.strip()
+    return (
+        subject_matches(question, sentence)
+        and any(x in q for x in ["what year", "which year", "when "])
+        and extract_year(sentence) is not None
+        and any(x in s for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"])
+    )
 
 
-def extract_who_answer(question: str, sentence: str) -> Optional[str]:
+def who_sentence_matches(question: str, sentence: str) -> bool:
     q = question.lower()
     s = sentence.lower()
+    return (
+        subject_matches(question, sentence)
+        and (q.startswith("who ") or " who " in q)
+        and any(x in s for x in ["developed by", "created by", "built by", "made by", "founded by"])
+    )
 
+
+def language_sentence_matches(question: str, sentence: str) -> bool:
+    q = question.lower()
+    s = sentence.lower()
+    return (
+        subject_matches(question, sentence)
+        and any(x in q for x in ["written in", "programmed in", "what language", "which language"])
+        and any(x in s for x in ["written in", "implemented in", "programmed in"])
+    )
+
+
+def generic_sentence_matches(question: str, sentence: str) -> bool:
     if not subject_matches(question, sentence):
-        return None
-    if not (q.startswith("who ") or " who " in q):
-        return None
-    if not any(x in s for x in ["developed by", "created by", "built by", "made by", "founded by"]):
-        return None
-
-    return sentence.strip()
-
-
-def extract_generic_answer(question: str, sentence: str) -> Optional[str]:
-    if not subject_matches(question, sentence):
-        return None
-
+        return False
     q_tokens = tokenize(question)
     s_tokens = tokenize(sentence)
     overlap = q_tokens & s_tokens
-
-    if len(overlap) >= max(2, len(q_tokens) // 2):
-        return sentence.strip()
-
-    return None
+    return len(overlap) >= max(2, len(q_tokens) // 2)
 
 
-def find_matches(question: str, chunks: List[Chunk]) -> List[Tuple[str, str]]:
+def sentence_matches(question: str, sentence: str) -> bool:
     q_type = question_type(question)
-    matches = []
+    if q_type == "year":
+        return year_sentence_matches(question, sentence)
+    if q_type == "who":
+        return who_sentence_matches(question, sentence)
+    if q_type == "language":
+        return language_sentence_matches(question, sentence)
+    return generic_sentence_matches(question, sentence)
 
+
+def find_exact_matches(question: str, chunks: List[Chunk]) -> List[Tuple[str, str]]:
+    matches = []
     for chunk in chunks:
         for sentence in split_sentences(chunk.text):
-            answer = None
-
-            if q_type == "year":
-                answer = extract_year_answer(question, sentence)
-            elif q_type == "language":
-                answer = extract_language_answer(question, sentence)
-            elif q_type == "who":
-                answer = extract_who_answer(question, sentence)
-            else:
-                answer = extract_generic_answer(question, sentence)
-
-            if answer:
-                matches.append((chunk.chunk_id, answer))
-
+            if sentence_matches(question, sentence):
+                matches.append((chunk.chunk_id, sentence))
     return matches
 
 
@@ -200,16 +183,20 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        matches = find_matches(question, chunks)
+        matches = find_exact_matches(question, chunks)
 
-        # safest policy: answer only when exactly one strong match exists
-        if len(matches) != 1:
+        # No exact grounded support
+        if len(matches) == 0:
             return unanswerable_response()
 
-        chunk_id, answer = matches[0]
+        # More than one support sentence => ambiguous, safest is abstain
+        if len(matches) > 1:
+            return unanswerable_response()
+
+        chunk_id, exact_sentence = matches[0]
 
         return QAResponse(
-            answer=answer,
+            answer=exact_sentence,
             citations=[chunk_id],
             confidence=0.9,
             answerable=True,
