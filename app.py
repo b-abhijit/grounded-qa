@@ -1,5 +1,5 @@
 import re
-from typing import List, Set, Optional
+from typing import List, Optional, Set, Tuple
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,11 +71,6 @@ def tokenize(text: str) -> Set[str]:
     return {w for w in words if w not in STOPWORDS}
 
 
-def extract_year(text: str) -> Optional[str]:
-    m = re.search(r"\b(19|20)\d{2}\b", text)
-    return m.group(0) if m else None
-
-
 def unanswerable_response() -> QAResponse:
     return QAResponse(
         answer="I don't know",
@@ -96,31 +91,18 @@ def question_type(question: str) -> str:
     return "generic"
 
 
-def relation_type(question: str) -> str:
-    q = question.lower()
-    if any(x in q for x in ["release", "released", "open-sourced", "open sourced", "launched"]):
-        return "release"
-    if any(x in q for x in ["developed", "created", "built", "made"]):
-        return "developed"
-    if any(x in q for x in ["written in", "programmed in", "language"]):
-        return "language"
-    if any(x in q for x in ["founded", "founder"]):
-        return "founded"
-    return "generic"
-
-
 def subject_tokens(question: str) -> Set[str]:
     q_tokens = tokenize(question)
-    relation_words = {
+    ignore = {
         "release", "released", "open", "opened", "sourced", "launched",
         "developed", "created", "built", "made",
         "written", "programmed", "language",
         "founded", "founder", "year", "when", "who", "what", "which"
     }
-    return {t for t in q_tokens if t not in relation_words and len(t) > 2}
+    return {t for t in q_tokens if t not in ignore and len(t) > 2}
 
 
-def subject_supported(question: str, sentence: str) -> bool:
+def subject_matches(question: str, sentence: str) -> bool:
     needed = subject_tokens(question)
     if not needed:
         return False
@@ -128,96 +110,85 @@ def subject_supported(question: str, sentence: str) -> bool:
     return needed.issubset(s_tokens)
 
 
-def relation_supported(question: str, sentence: str) -> bool:
-    rel = relation_type(question)
+def extract_year_answer(question: str, sentence: str) -> Optional[str]:
+    if not subject_matches(question, sentence):
+        return None
+    if not any(x in question.lower() for x in ["what year", "which year", "when "]):
+        return None
+
+    year_match = re.search(r"\b(19|20)\d{2}\b", sentence)
+    if not year_match:
+        return None
+
+    if not any(x in sentence.lower() for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"]):
+        return None
+
+    return sentence.strip()
+
+
+def extract_language_answer(question: str, sentence: str) -> Optional[str]:
+    q = question.lower()
     s = sentence.lower()
 
-    if rel == "release":
-        return any(x in s for x in ["released", "open-sourced", "open sourced", "launched"])
-    if rel == "developed":
-        return any(x in s for x in ["developed by", "created by", "built by", "made by", "developed"])
-    if rel == "language":
-        return any(x in s for x in ["written in", "implemented in", "programmed in"])
-    if rel == "founded":
-        return any(x in s for x in ["founded by", "founder", "founded"])
+    if not subject_matches(question, sentence):
+        return None
+    if not any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
+        return None
+    if not any(x in s for x in ["written in", "implemented in", "programmed in"]):
+        return None
 
-    return True
+    return sentence.strip()
 
 
-def answer_type_supported(question: str, sentence: str) -> bool:
-    q_type = question_type(question)
+def extract_who_answer(question: str, sentence: str) -> Optional[str]:
+    q = question.lower()
     s = sentence.lower()
 
-    if q_type == "year":
-        return extract_year(sentence) is not None
+    if not subject_matches(question, sentence):
+        return None
+    if not (q.startswith("who ") or " who " in q):
+        return None
+    if not any(x in s for x in ["developed by", "created by", "built by", "made by", "founded by"]):
+        return None
 
-    if q_type == "who":
-        return any(x in s for x in ["developed by", "created by", "built by", "made by", "founded by"])
-
-    if q_type == "language":
-        return any(x in s for x in [
-            "written in", "implemented in", "programmed in",
-            "rust", "python", "java", "javascript", "go", "c++"
-        ])
-
-    return True
+    return sentence.strip()
 
 
-def exact_sentence_in_chunk(sentence: str, chunk_text: str) -> bool:
-    target = normalize(sentence).lower()
-    return any(normalize(s).lower() == target for s in split_sentences(chunk_text))
+def extract_generic_answer(question: str, sentence: str) -> Optional[str]:
+    if not subject_matches(question, sentence):
+        return None
 
-
-def sentence_score(question: str, sentence: str) -> float:
     q_tokens = tokenize(question)
     s_tokens = tokenize(sentence)
-
     overlap = q_tokens & s_tokens
-    if not overlap:
-        return 0.0
 
-    precision = len(overlap) / max(1, len(s_tokens))
-    recall = len(overlap) / max(1, len(q_tokens))
+    if len(overlap) >= max(2, len(q_tokens) // 2):
+        return sentence.strip()
 
-    if precision + recall == 0:
-        return 0.0
-
-    score = (2 * precision * recall) / (precision + recall)
-
-    if question_type(question) == "year" and extract_year(sentence):
-        score += 0.10
-
-    return min(score, 1.0)
+    return None
 
 
-def is_direct_answer(question: str, sentence: str) -> bool:
-    if not subject_supported(question, sentence):
-        return False
-    if not relation_supported(question, sentence):
-        return False
-    if not answer_type_supported(question, sentence):
-        return False
-
-    # Conservative threshold to prefer abstention over false positives
-    return sentence_score(question, sentence) >= 0.55
-
-
-def find_supported_answer(question: str, chunks: List[Chunk]):
-    best_chunk = None
-    best_sentence = None
-    best_score = 0.0
+def find_matches(question: str, chunks: List[Chunk]) -> List[Tuple[str, str]]:
+    q_type = question_type(question)
+    matches = []
 
     for chunk in chunks:
         for sentence in split_sentences(chunk.text):
-            if not is_direct_answer(question, sentence):
-                continue
-            score = sentence_score(question, sentence)
-            if score > best_score:
-                best_score = score
-                best_chunk = chunk
-                best_sentence = sentence
+            answer = None
 
-    return best_chunk, best_sentence, best_score
+            if q_type == "year":
+                answer = extract_year_answer(question, sentence)
+            elif q_type == "language":
+                answer = extract_language_answer(question, sentence)
+            elif q_type == "who":
+                answer = extract_who_answer(question, sentence)
+            else:
+                answer = extract_generic_answer(question, sentence)
+
+            if answer:
+                matches.append((chunk.chunk_id, answer))
+
+    return matches
 
 
 @app.post("/grounded-qa", response_model=QAResponse)
@@ -229,18 +200,18 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        best_chunk, best_sentence, best_score = find_supported_answer(question, chunks)
+        matches = find_matches(question, chunks)
 
-        if best_chunk is None or best_sentence is None:
+        # safest policy: answer only when exactly one strong match exists
+        if len(matches) != 1:
             return unanswerable_response()
 
-        if not exact_sentence_in_chunk(best_sentence, best_chunk.text):
-            return unanswerable_response()
+        chunk_id, answer = matches[0]
 
         return QAResponse(
-            answer=best_sentence,
-            citations=[best_chunk.chunk_id],
-            confidence=round(min(0.95, 0.75 + best_score * 0.15), 2),
+            answer=answer,
+            citations=[chunk_id],
+            confidence=0.9,
             answerable=True,
         )
 
