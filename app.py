@@ -1,33 +1,59 @@
 import re
-from typing import List, Optional, Set
+from typing import List, Set
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(title="SafeAnswer AI - Grounded QA API")
 
+# Safer CORS:
+# If you want allow_credentials=True, use explicit origins.
+# For assignment/demo use, easiest is credentials=False with wildcard.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
 
 class Chunk(BaseModel):
-    chunk_id: Optional[str] = None
-    text: Optional[str] = None
+    chunk_id: str = Field(..., min_length=1, max_length=100)
+    text: str = Field(..., min_length=1, max_length=5000)
+
+    @field_validator("chunk_id", "text")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Field cannot be blank")
+        return v
 
 
 class QARequest(BaseModel):
-    question: Optional[str] = None
-    chunks: Optional[List[Chunk]] = None
+    question: str = Field(..., min_length=1, max_length=1000)
+    chunks: List[Chunk] = Field(..., min_length=1)
+
+    @field_validator("question")
+    @classmethod
+    def question_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Question cannot be blank")
+        return v
+
+
+class QAResponse(BaseModel):
+    answer: str
+    citations: List[str]
+    confidence: float
+    answerable: bool
 
 
 STOPWORDS: Set[str] = {
-    "the", "is", "are", "were", "a", "an", "of", "in", "on", "for",
+    "the", "is", "are", "was", "were", "a", "an", "of", "in", "on", "for",
     "to", "and", "or", "what", "when", "where", "who", "which", "how",
     "did", "does", "do", "by", "at", "as", "with", "that", "this", "it",
     "from", "into", "their", "there", "been", "being", "have", "has", "had"
@@ -35,11 +61,12 @@ STOPWORDS: Set[str] = {
 
 
 def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
+    return re.sub(r"\s+", " ", text.strip())
 
 
 def split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalize(text)) if s.strip()]
+    text = normalize(text)
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
 def tokenize(text: str) -> Set[str]:
@@ -47,21 +74,21 @@ def tokenize(text: str) -> Set[str]:
     return {w for w in words if w not in STOPWORDS}
 
 
-def extract_year(text: str) -> Optional[str]:
+def extract_year(text: str) -> str | None:
     m = re.search(r"\b(19|20)\d{2}\b", text)
     return m.group(0) if m else None
 
 
-def unanswerable_response():
-    return {
-        "answer": "I don't know",
-        "citations": [],
-        "confidence": 0.1,
-        "answerable": False,
-    }
+def unanswerable_response() -> QAResponse:
+    return QAResponse(
+        answer="I don't know",
+        citations=[],
+        confidence=0.1,
+        answerable=False,
+    )
 
 
-def question_type(question: str) -> str:
+def detect_question_type(question: str) -> str:
     q = question.lower()
     if "what year" in q or "which year" in q or q.startswith("when "):
         return "year"
@@ -72,7 +99,7 @@ def question_type(question: str) -> str:
     return "generic"
 
 
-def relation_type(question: str) -> str:
+def detect_relation_type(question: str) -> str:
     q = question.lower()
     if any(x in q for x in ["release", "released", "open-sourced", "open sourced", "launched"]):
         return "release"
@@ -85,7 +112,7 @@ def relation_type(question: str) -> str:
     return "generic"
 
 
-def answer_type_supported(q_type: str, sentence: str) -> bool:
+def question_type_supported(q_type: str, sentence: str) -> bool:
     s = sentence.lower()
     if q_type == "year":
         return extract_year(sentence) is not None
@@ -114,7 +141,7 @@ def subject_overlap(question: str, sentence: str) -> bool:
     s_tokens = tokenize(sentence)
 
     relation_words = {
-        "release", "released", "open", "opened", "open-sourced", "launched",
+        "release", "released", "open", "opened", "open", "sourced", "launched",
         "developed", "created", "built", "made",
         "written", "programmed", "language",
         "founded", "founder", "year", "when", "who", "what", "which"
@@ -125,7 +152,7 @@ def subject_overlap(question: str, sentence: str) -> bool:
         return False
 
     overlap = entity_tokens & s_tokens
-    return len(overlap) == len(entity_tokens)
+    return len(overlap) >= max(1, len(entity_tokens) - 1)
 
 
 def sentence_score(question: str, sentence: str) -> float:
@@ -133,14 +160,19 @@ def sentence_score(question: str, sentence: str) -> float:
     s_tokens = tokenize(sentence)
     if not q_tokens or not s_tokens:
         return 0.0
+
     overlap = q_tokens & s_tokens
     precision = len(overlap) / len(s_tokens)
     recall = len(overlap) / len(q_tokens)
+
     if precision + recall == 0:
         return 0.0
+
     score = (2 * precision * recall) / (precision + recall)
-    if extract_year(sentence) and question_type(question) == "year":
+
+    if extract_year(sentence) and detect_question_type(question) == "year":
         score += 0.15
+
     return min(score, 1.0)
 
 
@@ -152,48 +184,53 @@ def find_best_support(question: str, chunks: List[Chunk]):
     best_chunk = None
     best_sentence = None
     best_score = 0.0
-    q_type = question_type(question)
-    rel_type = relation_type(question)
+
+    q_type = detect_question_type(question)
+    rel_type = detect_relation_type(question)
+
     for chunk in chunks:
-        if not chunk.chunk_id or not chunk.text:
-            continue
         for sentence in split_sentences(chunk.text):
             if not subject_overlap(question, sentence):
                 continue
             if not relation_supported(rel_type, sentence):
                 continue
-            if not answer_type_supported(q_type, sentence):
+            if not question_type_supported(q_type, sentence):
                 continue
+
             score = sentence_score(question, sentence)
             if score > best_score:
                 best_score = score
                 best_chunk = chunk
                 best_sentence = sentence
+
     return best_chunk, best_sentence, best_score
 
 
-@app.post("/grounded-qa")
+@app.post("/grounded-qa", response_model=QAResponse)
 async def grounded_qa(payload: QARequest):
     try:
-        question = normalize(payload.question or "")
-        chunks = payload.chunks or []
-        if not question or not chunks:
+        question = normalize(payload.question)
+        chunks = payload.chunks
+
+        best_chunk, best_sentence, best_score = find_best_support(question, chunks)
+
+        if best_chunk is None or best_sentence is None or best_score < 0.35:
             return unanswerable_response()
-        valid_chunks = [c for c in chunks if isinstance(c.chunk_id, str) and c.chunk_id.strip() and isinstance(c.text, str) and c.text.strip()]
-        if not valid_chunks:
-            return unanswerable_response()
-        best_chunk, best_sentence, best_score = find_best_support(question, valid_chunks)
-        if best_chunk is None or best_sentence is None or best_score < 0.34:
-            return unanswerable_response()
+
         answer = best_sentence.strip()
+
         if not exact_support_check(answer, best_chunk.text):
             return unanswerable_response()
-        return {
-            "answer": answer,
-            "citations": [best_chunk.chunk_id],
-            "confidence": round(min(0.95, 0.45 + best_score * 0.45), 2),
-            "answerable": True,
-        }
+
+        confidence = round(min(0.95, 0.45 + best_score * 0.45), 2)
+
+        return QAResponse(
+            answer=answer,
+            citations=[best_chunk.chunk_id],
+            confidence=confidence,
+            answerable=True,
+        )
+
     except Exception:
         return unanswerable_response()
 
