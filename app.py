@@ -7,8 +7,6 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(title="SafeAnswer AI - Grounded QA API")
 
-# For public testing, keep this simple:
-# wildcard origins are okay only when allow_credentials is False.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -89,34 +87,25 @@ def unanswerable_response() -> QAResponse:
 
 def question_type(question: str) -> str:
     q = question.lower()
-
     if "what year" in q or "which year" in q or q.startswith("when "):
         return "year"
-
     if q.startswith("who ") or " who " in q:
         return "who"
-
     if any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
         return "language"
-
     return "generic"
 
 
 def relation_type(question: str) -> str:
     q = question.lower()
-
     if any(x in q for x in ["release", "released", "open-sourced", "open sourced", "launched"]):
         return "release"
-
     if any(x in q for x in ["developed", "created", "built", "made"]):
         return "developed"
-
     if any(x in q for x in ["written in", "programmed in", "language"]):
         return "language"
-
     if any(x in q for x in ["founded", "founder"]):
         return "founded"
-
     return "generic"
 
 
@@ -132,14 +121,11 @@ def subject_tokens(question: str) -> Set[str]:
 
 
 def subject_supported(question: str, sentence: str) -> bool:
-    q_subject = subject_tokens(question)
-    s_tokens = tokenize(sentence)
-
-    if not q_subject:
+    needed = subject_tokens(question)
+    if not needed:
         return False
-
-    overlap = q_subject & s_tokens
-    return len(overlap) == len(q_subject)
+    s_tokens = tokenize(sentence)
+    return needed.issubset(s_tokens)
 
 
 def relation_supported(question: str, sentence: str) -> bool:
@@ -148,13 +134,10 @@ def relation_supported(question: str, sentence: str) -> bool:
 
     if rel == "release":
         return any(x in s for x in ["released", "open-sourced", "open sourced", "launched"])
-
     if rel == "developed":
         return any(x in s for x in ["developed by", "created by", "built by", "made by", "developed"])
-
     if rel == "language":
         return any(x in s for x in ["written in", "implemented in", "programmed in"])
-
     if rel == "founded":
         return any(x in s for x in ["founded by", "founder", "founded"])
 
@@ -180,19 +163,21 @@ def answer_type_supported(question: str, sentence: str) -> bool:
     return True
 
 
+def exact_sentence_in_chunk(sentence: str, chunk_text: str) -> bool:
+    target = normalize(sentence).lower()
+    return any(normalize(s).lower() == target for s in split_sentences(chunk_text))
+
+
 def sentence_score(question: str, sentence: str) -> float:
     q_tokens = tokenize(question)
     s_tokens = tokenize(sentence)
-
-    if not q_tokens or not s_tokens:
-        return 0.0
 
     overlap = q_tokens & s_tokens
     if not overlap:
         return 0.0
 
-    precision = len(overlap) / len(s_tokens)
-    recall = len(overlap) / len(q_tokens)
+    precision = len(overlap) / max(1, len(s_tokens))
+    recall = len(overlap) / max(1, len(q_tokens))
 
     if precision + recall == 0:
         return 0.0
@@ -200,33 +185,32 @@ def sentence_score(question: str, sentence: str) -> float:
     score = (2 * precision * recall) / (precision + recall)
 
     if question_type(question) == "year" and extract_year(sentence):
-        score += 0.15
+        score += 0.10
 
     return min(score, 1.0)
 
 
-def exact_sentence_in_chunk(sentence: str, chunk_text: str) -> bool:
-    sentences = split_sentences(chunk_text)
-    normalized_sentence = normalize(sentence).lower()
-    return any(normalize(s).lower() == normalized_sentence for s in sentences)
+def is_direct_answer(question: str, sentence: str) -> bool:
+    if not subject_supported(question, sentence):
+        return False
+    if not relation_supported(question, sentence):
+        return False
+    if not answer_type_supported(question, sentence):
+        return False
+
+    # Conservative threshold to prefer abstention over false positives
+    return sentence_score(question, sentence) >= 0.55
 
 
-def find_best_supported_sentence(question: str, chunks: List[Chunk]):
+def find_supported_answer(question: str, chunks: List[Chunk]):
     best_chunk = None
     best_sentence = None
     best_score = 0.0
 
     for chunk in chunks:
         for sentence in split_sentences(chunk.text):
-            if not subject_supported(question, sentence):
+            if not is_direct_answer(question, sentence):
                 continue
-
-            if not relation_supported(question, sentence):
-                continue
-
-            if not answer_type_supported(question, sentence):
-                continue
-
             score = sentence_score(question, sentence)
             if score > best_score:
                 best_score = score
@@ -245,20 +229,18 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        best_chunk, best_sentence, best_score = find_best_supported_sentence(question, chunks)
+        best_chunk, best_sentence, best_score = find_supported_answer(question, chunks)
 
-        # Conservative threshold to reduce false positives.
-        if best_chunk is None or best_sentence is None or best_score < 0.50:
+        if best_chunk is None or best_sentence is None:
             return unanswerable_response()
 
-        # The answer must be the exact sentence from the cited chunk.
         if not exact_sentence_in_chunk(best_sentence, best_chunk.text):
             return unanswerable_response()
 
         return QAResponse(
             answer=best_sentence,
             citations=[best_chunk.chunk_id],
-            confidence=0.9,
+            confidence=round(min(0.95, 0.75 + best_score * 0.15), 2),
             answerable=True,
         )
 
