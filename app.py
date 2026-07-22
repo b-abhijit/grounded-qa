@@ -75,41 +75,57 @@ def unanswerable_response() -> QAResponse:
     )
 
 
-def important_tokens(question: str) -> Set[str]:
+def subject_tokens(question: str) -> Set[str]:
+    q_tokens = tokenize(question)
     ignore = {
         "what", "when", "where", "who", "which", "how",
         "release", "released", "open", "opened", "sourced", "launched",
-        "developed", "created", "built", "made", "written", "programmed",
-        "language", "founded", "founder", "year"
+        "developed", "created", "built", "made",
+        "written", "programmed", "language",
+        "founded", "founder", "year"
     }
-    return {t for t in tokenize(question) if t not in ignore and len(t) > 2}
+    return {t for t in q_tokens if t not in ignore and len(t) > 2}
 
 
-def chunk_matches_question(question: str, chunk_text: str) -> bool:
+def question_type(question: str) -> str:
+    q = question.lower()
+    if "what year" in q or "which year" in q or q.startswith("when "):
+        return "year"
+    if q.startswith("who ") or " who " in q:
+        return "who"
+    if any(x in q for x in ["written in", "programmed in", "what language", "which language"]):
+        return "language"
+    return "unknown"
+
+
+def exact_chunk_match(question: str, chunk_text: str) -> bool:
     q = question.lower()
     text = chunk_text.lower()
-    tokens = important_tokens(question)
+    needed = subject_tokens(question)
 
-    if not tokens:
+    if not needed:
         return False
 
-    if not tokens.issubset(tokenize(chunk_text)):
+    chunk_tokens = tokenize(chunk_text)
+    if not needed.issubset(chunk_tokens):
         return False
 
-    if ("what year" in q or "which year" in q or q.startswith("when ")) and not re.search(r"\b(19|20)\d{2}\b", text):
-        return False
+    q_type = question_type(question)
 
-    if any(x in q for x in ["written in", "programmed in", "what language", "which language"]) and not any(
-        x in text for x in ["written in", "implemented in", "programmed in"]
-    ):
-        return False
+    if q_type == "year":
+        if not re.search(r"\b(19|20)\d{2}\b", text):
+            return False
+        if not any(x in text for x in ["released", "open-sourced", "open sourced", "launched", "developed", "created", "founded"]):
+            return False
+        return True
 
-    if (q.startswith("who ") or " who " in q) and not any(
-        x in text for x in ["developed by", "created by", "built by", "made by", "founded by"]
-    ):
-        return False
+    if q_type == "who":
+        return any(x in text for x in ["developed by", "created by", "built by", "made by", "founded by"])
 
-    return True
+    if q_type == "language":
+        return any(x in text for x in ["written in", "implemented in", "programmed in"])
+
+    return False
 
 
 @app.post("/grounded-qa", response_model=QAResponse)
@@ -121,17 +137,19 @@ async def grounded_qa(payload: QARequest):
         if not question or not chunks:
             return unanswerable_response()
 
-        matches = [c for c in chunks if chunk_matches_question(question, c.text)]
+        matches = [chunk for chunk in chunks if exact_chunk_match(question, chunk.text)]
 
-        # safest strict mode: exactly one supporting chunk only
+        # Strict abstention policy:
+        # zero matches => unanswerable
+        # multiple matches => ambiguous => unanswerable
         if len(matches) != 1:
             return unanswerable_response()
 
-        matched = matches[0]
+        match = matches[0]
 
         return QAResponse(
-            answer=matched.text.strip(),
-            citations=[matched.chunk_id],
+            answer=match.text.strip(),
+            citations=[match.chunk_id],
             confidence=0.9,
             answerable=True,
         )
